@@ -1,0 +1,31 @@
+name: Sync Telegram to Google Sheet
+
+on:
+  schedule:
+    # 每小时整点跑一次（UTC 时区，但对 hourly 来说时区不影响节奏）
+    # 注意：GitHub 的 cron 偶尔会延迟几分钟到十几分钟，不是精确时间，对本场景没影响
+    - cron: '0 * * * *'
+  workflow_dispatch: {}   # 也允许在 Actions 页面手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          TELEGRAM_GROUP_CHAT_ID: ${{ secrets.TELEGRAM_GROUP_CHAT_ID }}
+        run: python telegram_to_sheet.py

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Telegram -> Google Sheet 同步脚本
-每小时运行一次，把"@ 了 Bot"的群消息用 Gemini 智能解析后写入 Google Sheet。
+每小时运行一次，把"@ 了 Bot"的群消息用 Anthropic Claude 智能解析后写入 Google Sheet。
 
 触发规则：
     1) 消息文本里包含 @<botusername>
@@ -9,13 +9,13 @@ Telegram -> Google Sheet 同步脚本
     3) 或者消息里用了 text_mention 提及 Bot
 
 依赖（见 requirements.txt）:
-    requests, gspread, google-auth, google-generativeai
+    requests, gspread, google-auth, anthropic
 
 需要的环境变量:
     TELEGRAM_BOT_TOKEN          - BotFather 给你的 Bot Token
     GOOGLE_SHEET_ID             - 目标 Google Sheet 的 ID（URL 里 /d/ 后面那段）
     GOOGLE_SERVICE_ACCOUNT_JSON - Service Account 的 JSON 密钥（整段内容）
-    GEMINI_API_KEY              - Google AI Studio 拿的 Gemini API Key
+    ANTHROPIC_API_KEY           - 在 console.anthropic.com 申请，sk-ant-... 开头
     TELEGRAM_GROUP_CHAT_ID      - (可选) 限定只处理这个群的消息
 """
 
@@ -27,18 +27,23 @@ from datetime import datetime, timezone
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-import google.generativeai as genai
+from anthropic import Anthropic
 
 
 # ============== 配置 ==============
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GROUP_CHAT_ID = os.environ.get("TELEGRAM_GROUP_CHAT_ID")
 
 DATA_TAB = "数据"
 STATE_TAB = "_state"
+
+# Claude 模型：Haiku 4.5 又快又便宜，足以做字段抽取
+# 想用更强的可以换成 "claude-sonnet-4-6"，更便宜可以试已有的更小模型
+CLAUDE_MODEL = "claude-haiku-4-5-20251001"
+
 
 # ============== 字段定义 ==============
 # (列名, LLM 用来判断该字段该填什么的描述)
@@ -59,49 +64,53 @@ FIELD_DEFINITIONS = [
 FIELD_NAMES = [name for name, _ in FIELD_DEFINITIONS]
 
 
-# ============== Gemini 配置 ==============
-genai.configure(api_key=GEMINI_API_KEY)
+# ============== Anthropic 配置 ==============
+_anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-SYSTEM_PROMPT = """你是一个加密货币项目信息解析助手。从用户给你的 Telegram 群消息里抽取结构化字段。
+SYSTEM_PROMPT = """你是一个加密货币项目信息解析助手。从用户给你的 Telegram 群消息里抽取结构化字段，通过 extract_fields 工具返回。
 
 规则：
-- 严格按照定义的 JSON Schema 输出，所有字段都必须出现，没提到的字段输出空字符串 ""
+- 必须调用 extract_fields 工具
+- 所有字段都要出现，没提到的字段留空字符串 ""
 - 字段值必须是字符串类型（即使是数字也用字符串表示）
 - 不要编造消息里没有的信息——拿不准就留空
 - 估值统一换成纯数字字符串（"10k" → "10000"，"1.5m" → "1500000"，"$2M" → "2000000"）
-- 不要把消息发送者自己当成"联系人"，"联系人"指消息里提到的对方负责人
+- 不要把消息发送者本人当成"联系人"，"联系人"指消息里提到的对方负责人
+"""
 
-字段说明：
-""" + "\n".join(f"- {name}: {desc}" for name, desc in FIELD_DEFINITIONS)
-
-RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {name: {"type": "string"} for name, _ in FIELD_DEFINITIONS},
-    "required": FIELD_NAMES,
+# 用 tool_use 让 Claude 输出结构化 JSON，比让它在文本里返回 JSON 更稳
+EXTRACT_TOOL = {
+    "name": "extract_fields",
+    "description": "从加密货币项目相关的 Telegram 消息中抽取结构化字段。所有字段都必须出现，没提到的字段填空字符串。",
+    "input_schema": {
+        "type": "object",
+        "properties": {name: {"type": "string", "description": desc} for name, desc in FIELD_DEFINITIONS},
+        "required": FIELD_NAMES,
+    },
 }
-
-_GEMINI_MODEL = genai.GenerativeModel(
-    "gemini-2.0-flash",
-    system_instruction=SYSTEM_PROMPT,
-)
 
 
 def parse_with_llm(text: str) -> dict:
-    """调用 Gemini 解析消息，返回 {字段名: 值} 字典；失败时返回全空。"""
+    """调用 Claude 解析消息，返回 {字段名: 值} 字典；失败时返回全空。"""
     if not text.strip():
         return {f: "" for f in FIELD_NAMES}
     try:
-        response = _GEMINI_MODEL.generate_content(
-            text,
-            generation_config={
-                "response_mime_type": "application/json",
-                "response_schema": RESPONSE_SCHEMA,
-                "temperature": 0,
-            },
+        response = _anthropic_client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            tools=[EXTRACT_TOOL],
+            tool_choice={"type": "tool", "name": "extract_fields"},
+            messages=[{"role": "user", "content": text}],
         )
-        result = json.loads(response.text)
-        # 防御性补齐 + 类型转字符串
-        return {f: str(result.get(f, "") or "") for f in FIELD_NAMES}
+        for block in response.content:
+            if block.type == "tool_use" and block.name == "extract_fields":
+                result = block.input
+                # 防御性补齐 + 类型转字符串
+                return {f: str(result.get(f, "") or "") for f in FIELD_NAMES}
+        # 没拿到 tool_use（理论上不应该发生）
+        print(f"[warn] no tool_use in response: {response}")
+        return {f: "" for f in FIELD_NAMES}
     except Exception as exc:
         print(f"[warn] LLM parse failed: {exc}")
         return {f: "" for f in FIELD_NAMES}

@@ -37,7 +37,7 @@ SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GROUP_CHAT_ID = os.environ.get("TELEGRAM_GROUP_CHAT_ID")
 
-DATA_TAB = "数据"
+DATA_TAB = "Data"
 STATE_TAB = "_state"
 
 # Claude 模型：Haiku 4.5 又快又便宜，足以做字段抽取
@@ -45,55 +45,59 @@ STATE_TAB = "_state"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
 
-# ============== 字段定义 ==============
-# (列名, LLM 用来判断该字段该填什么的描述)
-# 想增删/改字段，直接编辑这个列表即可。
-# 注意：如果你已经有一个 `数据` tab 且表头跟这里不一致，需要先把那个 tab 删掉，
-# 让脚本下次跑时自动按新字段重新建表头。
+# ============== Field definitions ==============
+# (internal_key, sheet_column_header, description for the LLM)
+# Edit this list to add/remove fields. Both keys and headers should be ASCII.
+# Note: if you already have a `Data` tab whose header doesn't match, delete that
+# tab first so the script can recreate it with the new headers next run.
 FIELD_DEFINITIONS = [
-    ("项目名", "加密货币项目的名字，英文为主。如果没有提到留空。"),
-    ("估值", "项目估值，统一换成纯数字字符串。'10k' → '10000'，'1.5m' → '1500000'，'2亿' → '200000000'。如果没有提到留空。"),
-    ("类别", "项目的赛道或类别，比如 DeFi / 隐私 / L2 / AI / Meme / RWA / SocialFi / Infra 等。如果没有提到留空。"),
-    ("轮次", "融资轮次。比如 Pre-seed / Seed / A轮 / B轮 / Strategic 等。如果没有提到留空。"),
-    ("官网", "项目官方网站的 URL（不是 deck 链接）。如果消息里没有官网 URL 留空。"),
-    ("Deck", "项目 deck 的链接或附件文件名。如果消息附带 PDF/PPT/PPTX 文件，写文件名（如 'deck.pdf'）；如果是 URL（链接里出现 docsend / drive / dropbox / notion / pitch.com 这类关键字），写完整 URL；都没有就留空。"),
-    ("联系人", "项目方对接人的名字（注意：不是消息发送者本人，是消息里提到的对方负责人）。如果没有提到留空。"),
-    ("备注", "其他没被上面字段覆盖的关键信息，简短归纳一两句话。如果没有特别信息留空。"),
+    ("project_name", "Project", "Name of the crypto project. Leave empty if not mentioned."),
+    ("valuation", "Valuation", "Project valuation as a pure number string. '10k' -> '10000', '1.5m' -> '1500000', '$2M' -> '2000000'. Leave empty if not mentioned."),
+    ("category", "Category", "Project's sector / category, e.g. DeFi, Privacy, L2, AI, Meme, RWA, SocialFi, Infra. Leave empty if not mentioned."),
+    ("round", "Round", "Funding round, e.g. Pre-seed / Seed / Series A / Series B / Strategic. Leave empty if not mentioned."),
+    ("website", "Website", "URL of the official project website (NOT a deck link). Leave empty if no website URL is in the message."),
+    ("deck", "Deck", "The project's pitch deck — either an attached file name (e.g. 'deck.pdf') or a URL (typically containing docsend / drive / dropbox / notion / pitch.com). Leave empty if neither."),
+    ("contact", "Contact", "Name of the contact person on the project side (NOT the message sender). Leave empty if not mentioned."),
+    ("notes", "Notes", "Any other key information not covered by the fields above, summarized in one short sentence. Leave empty if nothing notable."),
 ]
 
-FIELD_NAMES = [name for name, _ in FIELD_DEFINITIONS]
+FIELD_KEYS = [k for k, _, _ in FIELD_DEFINITIONS]                # internal keys
+FIELD_DISPLAY_NAMES = [d for _, d, _ in FIELD_DEFINITIONS]       # sheet headers
 
 
 # ============== Anthropic 配置 ==============
 _anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-SYSTEM_PROMPT = """你是一个加密货币项目信息解析助手。从用户给你的 Telegram 群消息里抽取结构化字段，通过 extract_fields 工具返回。
+SYSTEM_PROMPT = """You extract structured fields about crypto projects from Telegram group messages.
+The message may be in any language (English, Chinese, etc.) — interpret it correctly regardless.
 
-规则：
-- 必须调用 extract_fields 工具
-- 所有字段都要出现，没提到的字段留空字符串 ""
-- 字段值必须是字符串类型（即使是数字也用字符串表示）
-- 不要编造消息里没有的信息——拿不准就留空
-- 估值统一换成纯数字字符串（"10k" → "10000"，"1.5m" → "1500000"，"$2M" → "2000000"）
-- 不要把消息发送者本人当成"联系人"，"联系人"指消息里提到的对方负责人
-"""
+Rules:
+- You MUST call the extract_fields tool
+- All fields must appear in the output. Use empty string "" for any field not mentioned
+- All field values must be strings (wrap numbers in quotes)
+- Do not invent information that isn't in the message — when in doubt, leave it empty
+- For valuation, output a pure number string: "10k" -> "10000", "1.5m" -> "1500000", "$2M" -> "2000000"
+- The "contact" field is the person on the project side, NOT the message sender
 
-# 用 tool_use 让 Claude 输出结构化 JSON，比让它在文本里返回 JSON 更稳
+Field meanings (key -> description):
+""" + "\n".join(f"- {k}: {desc}" for k, _, desc in FIELD_DEFINITIONS)
+
+# tool_use forces structured JSON output — more reliable than free-form JSON in text
 EXTRACT_TOOL = {
     "name": "extract_fields",
-    "description": "从加密货币项目相关的 Telegram 消息中抽取结构化字段。所有字段都必须出现，没提到的字段填空字符串。",
+    "description": "Extract structured fields from a crypto-project-related Telegram message. All fields must appear; use empty string for missing ones.",
     "input_schema": {
         "type": "object",
-        "properties": {name: {"type": "string", "description": desc} for name, desc in FIELD_DEFINITIONS},
-        "required": FIELD_NAMES,
+        "properties": {key: {"type": "string", "description": desc} for key, _, desc in FIELD_DEFINITIONS},
+        "required": FIELD_KEYS,
     },
 }
 
 
 def parse_with_llm(text: str) -> dict:
-    """调用 Claude 解析消息，返回 {字段名: 值} 字典；失败时返回全空。"""
+    """调用 Claude 解析消息，返回 {英文 key: 值} 字典；失败时返回全空。"""
     if not text.strip():
-        return {f: "" for f in FIELD_NAMES}
+        return {k: "" for k in FIELD_KEYS}
     try:
         response = _anthropic_client.messages.create(
             model=CLAUDE_MODEL,
@@ -107,13 +111,12 @@ def parse_with_llm(text: str) -> dict:
             if block.type == "tool_use" and block.name == "extract_fields":
                 result = block.input
                 # 防御性补齐 + 类型转字符串
-                return {f: str(result.get(f, "") or "") for f in FIELD_NAMES}
-        # 没拿到 tool_use（理论上不应该发生）
+                return {k: str(result.get(k, "") or "") for k in FIELD_KEYS}
         print(f"[warn] no tool_use in response: {response}")
-        return {f: "" for f in FIELD_NAMES}
+        return {k: "" for k in FIELD_KEYS}
     except Exception as exc:
         print(f"[warn] LLM parse failed: {exc}")
-        return {f: "" for f in FIELD_NAMES}
+        return {k: "" for k in FIELD_KEYS}
 
 
 # ============== Bot mention 判断 ==============
@@ -136,14 +139,14 @@ def is_bot_mentioned(msg: dict, bot_username: str) -> bool:
 
 
 def build_llm_input(msg: dict) -> str:
-    """合成给 LLM 看的内容：消息文本 + 附件文件名（如果有）。"""
+    """Build the text we feed to the LLM: message text + attachment filename if any."""
     parts = []
     text = msg.get("text") or msg.get("caption") or ""
     if text:
         parts.append(text)
     doc = msg.get("document")
     if doc:
-        parts.append(f"[附件: {doc.get('file_name', '未命名')}]")
+        parts.append(f"[Attachment: {doc.get('file_name', 'unnamed')}]")
     return "\n".join(parts)
 
 
@@ -188,12 +191,12 @@ def ensure_tabs(sheet):
     titles = [ws.title for ws in sheet.worksheets()]
     if STATE_TAB not in titles:
         ws = sheet.add_worksheet(title=STATE_TAB, rows=2, cols=2)
-        ws.update("A1:B1", [["key", "value"]])
-        ws.update("A2:B2", [["last_update_id", "0"]])
+        ws.update(values=[["key", "value"]], range_name="A1:B1")
+        ws.update(values=[["last_update_id", "0"]], range_name="A2:B2")
     if DATA_TAB not in titles:
-        ws = sheet.add_worksheet(title=DATA_TAB, rows=1000, cols=4 + len(FIELD_NAMES) + 5)
-        header = ["时间", "发送人", "原始消息", "message_id"] + FIELD_NAMES
-        ws.update("A1", [header])
+        ws = sheet.add_worksheet(title=DATA_TAB, rows=1000, cols=4 + len(FIELD_DISPLAY_NAMES) + 5)
+        header = ["Time", "Sender", "Message", "message_id"] + FIELD_DISPLAY_NAMES
+        ws.update(values=[header], range_name="A1")
 
 
 def get_last_update_id(sheet) -> int:
@@ -205,7 +208,7 @@ def get_last_update_id(sheet) -> int:
 
 
 def set_last_update_id(sheet, value: int):
-    sheet.worksheet(STATE_TAB).update("B2", [[str(value)]])
+    sheet.worksheet(STATE_TAB).update(values=[[str(value)]], range_name="B2")
 
 
 def append_rows(sheet, rows):
@@ -265,9 +268,9 @@ def main():
         original = msg.get("text") or msg.get("caption") or ""
         doc = msg.get("document")
         if doc:
-            original = (original + f"\n[附件: {doc.get('file_name', '未命名')}]").strip()
+            original = (original + f"\n[Attachment: {doc.get('file_name', 'unnamed')}]").strip()
 
-        row = [ts, sender, original, message_id] + [parsed.get(f, "") for f in FIELD_NAMES]
+        row = [ts, sender, original, message_id] + [parsed.get(k, "") for k in FIELD_KEYS]
         rows.append(row)
 
     if rows:

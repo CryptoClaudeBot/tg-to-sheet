@@ -177,6 +177,43 @@ def get_telegram_updates(offset=None):
     return data.get("result", [])
 
 
+def send_telegram_reply(chat_id, reply_to_message_id: int, text: str):
+    """给指定消息发一条 reply。失败不抛异常，只打 warn。"""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "reply_to_message_id": reply_to_message_id,
+                "allow_sending_without_reply": True,  # 原消息删掉了也照样发
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        if not resp.json().get("ok"):
+            print(f"[warn] reply not ok: {resp.text}")
+    except Exception as exc:
+        print(f"[warn] send reply failed (msg_id={reply_to_message_id}): {exc}")
+
+
+def build_confirmation_text(parsed: dict) -> str:
+    """根据解析结果生成回复文本。带上几个关键字段，发送者一眼能看到 LLM 抽出来什么。"""
+    lines = ["已记录 ✓"]
+    # 只展示这几个关键字段，避免回复太长
+    for key, label in [
+        ("project_name", "Project"),
+        ("valuation", "Valuation"),
+        ("category", "Category"),
+        ("round", "Round"),
+    ]:
+        val = (parsed.get(key) or "").strip()
+        if val:
+            lines.append(f"{label}: {val}")
+    return "\n".join(lines)
+
+
 # ============== Google Sheet ==============
 def get_sheet():
     creds_info = json.loads(SERVICE_ACCOUNT_JSON)
@@ -230,6 +267,7 @@ def main():
     print(f"[info] fetched {len(updates)} updates (offset={offset})")
 
     rows = []
+    confirmations = []  # 并行存 (chat_id, message_id, parsed) 用于写完 Sheet 后发回复
     new_last_id = last_id
 
     for upd in updates:
@@ -272,10 +310,18 @@ def main():
 
         row = [ts, sender, original, message_id] + [parsed.get(k, "") for k in FIELD_KEYS]
         rows.append(row)
+        confirmations.append((chat_id, message_id, parsed))
 
     if rows:
+        # 先写 Sheet —— 失败的话异常会抛出，下面回复就不会发，下次 cron 自动重试
         append_rows(sheet, rows)
         print(f"[info] appended {len(rows)} rows")
+
+        # Sheet 写入成功之后再发"已记录"回复，每条原消息一条 reply
+        for chat_id, msg_id, parsed in confirmations:
+            text = build_confirmation_text(parsed)
+            send_telegram_reply(chat_id, msg_id, text)
+        print(f"[info] sent {len(confirmations)} confirmation replies")
     else:
         print("[info] no @bot messages this run")
 

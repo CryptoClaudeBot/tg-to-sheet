@@ -274,17 +274,23 @@ def main():
         new_last_id = max(new_last_id, upd["update_id"])
         msg = upd.get("message") or upd.get("edited_message")
         if not msg:
+            print(f"[skip] update {upd['update_id']}: no message body (e.g. channel post / edit metadata)")
             continue
 
         chat_id = msg.get("chat", {}).get("id")
+        msg_id = msg.get("message_id")
         if GROUP_CHAT_ID and str(chat_id) != str(GROUP_CHAT_ID):
+            print(f"[skip] msg {msg_id}: chat_id {chat_id} != target {GROUP_CHAT_ID}")
             continue
 
         if not is_bot_mentioned(msg, bot_username):
+            text_preview = (msg.get("text") or msg.get("caption") or "<no text>")[:80]
+            print(f"[skip] msg {msg_id}: bot not @mentioned. text={text_preview!r}")
             continue
 
         llm_input = build_llm_input(msg)
         if not llm_input.strip():
+            print(f"[skip] msg {msg_id}: no text to parse (sticker / photo only?)")
             continue  # 纯贴纸/纯图片消息没文本可解析，跳过
 
         print(f"[info] parsing message_id={msg.get('message_id')}: {llm_input[:80]!r}")
